@@ -1,0 +1,25 @@
+# Artefactos de entrenamiento (ckpt, aux.pt, csv logs) — uno por modelo
+python/Models/*/logs/
+
+data/datasets/*.h5
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Julia
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+deps/deps.jl
+
+# IDE
+.vscode/
+.idea/
+
+.venv/
+.env/
+env/
+venv/

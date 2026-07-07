@@ -1,183 +1,287 @@
 # PMDKernel
 
-This repository contains a custom CUDA Julia kernel optimized for calculating the magnetic field of large sets of permanent magnets, modeled as dipole moment vectors, in any point in space.
+Kernel CUDA en Julia para calcular el campo magnético $B_0$ de imanes permanentes
+modelados como dipolos. Aplicación principal: simulación del **OSI² OpenMRI**
+(Open Source Imaging Initiative).
 
-As an application, `B0.jl` provides a full simulation of the magnetic field $B_0$ of the Open Source Imaging Initiative's (OSI²) OpenMRI.
+El repo contiene tres capas:
 
----
-
-## Estructura
-
-| Archivo                    | Rol                                                                 |
-|----------------------------|---------------------------------------------------------------------|
-| `B0.jl`                    | Entry point: grilla 3D completa del resonador + (opcional) sensores |
-| `kernel.jl`                | Kernel CUDA (Biot-Savart, tiling en memoria compartida)             |
-| `utils/sensores.jl`        | Evalúa el campo en todos los sensores del CSV                       |
-| `utils/disco.jl`           | Genera datasets tipo "disco" para entrenamiento de ML               |
-| `utils/perturb.jl`         | Genera configuraciones perturbadas (rotación, magnitud, ambas)      |
-| `utils/bench.jl`           | Benchmark del kernel                                                |
-| `utils/gru.jl`             | Visualización 3D (slicer ortogonal)                                 |
-| `data/B0.npz`              | Geometría nominal de imanes                                         |
-| `data/coordenadas_sensores.csv` | Coordenadas cilíndricas de sensores (radio cm, θ°, profundidad cm) |
-| `data/simulaciones/`       | Carpeta de salida para todos los NPZ generados                      |
+1. **Kernel CUDA + simulación** (`B0.jl`, `kernel.jl`) — Biot-Savart sobre dipolos
+   en cualquier conjunto de puntos.
+2. **Pipeline de datasets** (`simulate.jl` + `geometry.jl`) — perturbar imanes +
+   correr kernel sobre N geometrías arbitrarias + escribir HDF5. Fuente de datos
+   para entrenar redes.
+3. **Modelos de ML en Python** (`Python/Models/<NOMBRE>/`) — paquetes con
+   `data, model, train, metrics`. Notebooks homónimos en `Python/` los consumen
+   como wrappers visuales para iterar.
 
 ---
 
-## Uso básico
+## Convención de dimensiones
 
-```julia
-include("B0.jl")
+Todos los archivos del pipeline (Julia y Python) usan la misma notación.
 
-B0(true)                  # Grilla 121³ a 1 mm + visualización 3D
-B0(true; sens=true)       # + campo en los sensores
-B0(false)                 # Benchmark sin GUI
+### Pipeline / dataset / red
+
+| Símbolo | Significado                                       | Índice          |
+|---------|---------------------------------------------------|-----------------|
+| `N`     | nº de muestras (datasets)                         | n ∈ {1..N}      |
+| `I`     | nº de sensores                                    | i ∈ {1..I}      |
+| `J`     | nº de puntos de grilla (= Nx·Ny·Nz aplanado)      | j ∈ {1..J}      |
+| `Nx,Ny,Nz` | nº de puntos por eje (grilla cartesiana)       | —               |
+| `Nr,Nθ,Nz` | nº de puntos por eje (grilla cilíndrica)       | —               |
+
+
+### Kernel CUDA (genérico, no distingue sensores de grilla)
+
+| Símbolo | Significado                  |
+|---------|------------------------------|
+| `n`     | puntos de evaluación (cualquier conjunto: `n = I` para sensores, `n = J` para grilla) |
+| `m`     | dipolos / imanes             |
+
+El kernel toma `(R[n,3], P[3,m], M[3,m])` y devuelve `B[n,3]`. No sabe si
+estás evaluando en sensores o en grilla — eso lo decide el caller.
+
+### Ejemplos de shapes
+
+| Tensor                    | Shape                | Unidades |
+|---------------------------|----------------------|----------|
+| `geometria/grid/B` (HDF5) | `(N, J, 3)`          | mT       |
+| `geometria/sens/B` (HDF5) | `(N, I, 3)`          | mT       |
+| Vista 3D grilla           | `(N, Nx, Ny, Nz, 3)` | mT       |
+---
+
+## Estructura del repo
+
 ```
-
-Salidas:
-- `data/simulaciones/B_field.npz` — campo en la grilla completa
-- `data/simulaciones/Bsensores.npz` — campo en todos los sensores
+PMDKernel/
+├── julia/                              Lado Julia (kernel + simulación)
+│   ├── src/                            Biblioteca core
+│   │   ├── kernel.jl                   CUDA kernel _Bnu! (Biot-Savart, 4× unrolled)
+│   │   ├── B0.jl                       Pure B0(R,P,M)
+│   │   ├── geometry.jl                 struct Geometria + builders
+│   │   ├── perturb.jl                  perturb(...) → (P, M); incluye NOMINAL_SCALE_*
+│   │   ├── simulate.jl                 Pipeline: perturb → B0(g.R) por geometría → HDF5
+│   │   └── timer.jl                    StepTimer para benchmarks por paso
+│   ├── viz/
+│   │   └── gru.jl                      Slicer3D + mostrar_grilla (GLMakie)
+│   ├── bench/
+│   │   └── kernel_bench.jl             Benchmark sintético del kernel
+│   └── scripts/
+│       └── run_v1_dataset.jl           Driver de ejemplo
+│
+├── python/                             Lado Python (entrenamiento ML)
+│   ├── notebooks/
+│   │   ├── v1_fcnn.ipynb               Wrapper visual de Models/v1_fcnn
+│   │   └── v2_pinn.ipynb               Wrapper visual de Models/v2_pinn
+│   ├── Models/
+│   │   ├── v1_fcnn/                    Paquete: data, model, train, metrics
+│   │   │   └── logs/<run_tag>/         ckpt + aux.pt + csv (gitignored, autogenerado)
+│   │   ├── v2_pinn/
+│   │   │   └── logs/<run_tag>/
+│   │   └── v2_1_pinn/
+│   │       └── logs/<run_tag>/
+│   ├── train_v2_1.py                   CLI entry para v2_1_pinn
+│   └── comet_smoke_test.py
+│
+└── data/                               Inputs compartidos Julia/Python
+    ├── B0.npz                          Geometría nominal de imanes
+    ├── coordenadas_sensores.csv        Coordenadas (r_cm, θ°, z_cm) de los I sensores
+    └── datasets/                       Salida HDF5 de simular_dataset 
+```
 
 ---
 
-## Generación de datasets para ML (discos)
+## Pipeline de generación de datasets (Julia)
 
-Para entrenar un modelo de ML sin tener que simular el volumen completo en una
-tanda, dividimos el resonador en **discos**: losas delgadas (1 mm de grosor)
-perpendiculares al eje Z. Cada disco produce un par:
+`simulate.jl` es el entry point. Una geometría = un conjunto de puntos donde
+evaluar B (`struct Geometria(name, R, kind, meta)`, ver `geometry.jl`). Una
+simulación = N muestras × K geometrías. Para cada muestra `n = 1..N`:
 
-- **entrada** → campo B en los sensores que caen dentro del disco
-- **salida**  → campo B en una grilla X-Y reducida (paso 20 mm) a la misma Z
-
-Esto reduce drásticamente el cómputo por muestra y permite barrer capas Z y
-configuraciones perturbadas para armar el dataset.
-
-### Función principal: `simular_disco(z_mm; ...)`
-
-El primer argumento es la **coordenada Z** (en mm) donde se centra el disco.
-La función:
-
-1. Construye la grilla X-Y en esa Z (default: `-60:20:60` mm, 7×7 puntos).
-2. Filtra los sensores cuya Z caiga dentro del disco (`|z_sensor − z_mm| ≤ 0.5`).
-3. Corre el kernel sobre ambos conjuntos y guarda todo en un NPZ en
-   `data/simulaciones/`.
-
-### Ejemplo mínimo
-
-```julia
-include("B0.jl")             # carga kernel, BATCH_M, T
-include("utils/disco.jl")
-
-# Disco en z = 0 mm (capa central del resonador, depth = 22 cm en sensores)
-simular_disco(0f0; xy_step=20f0)
-# → data/simulaciones/disco_z0.0.npz
+```
+perturb(seed = seed_base + n)         →  P, M
+para cada g ∈ geometrias:
+    B0(g.R, P, M)                     →  B (n.points, 3)  Tesla
+    HDF5.write geometria/<g.name>/B[n]
 ```
 
-### Capas Z de los sensores
+Las geometrías se construyen una sola vez al inicio (no cambian entre muestras).
+Las salidas se almacenan en mT.
 
-Con el CSV actual (`coordenadas_sensores.csv`), los sensores se agrupan en
-5 profundidades (cm), convertidas a Z (mm) via `(depth − 22) × 10`:
+### Uso básico
 
-| depth (cm) | z (mm) | Nº sensores por capa |
-|------------|--------|----------------------|
-| 9.2        | −128   | 36                   |
-| 15.6       | −64    | 36                   |
-| 22         |   0    | 36                   |
-| 28.4       |  +64   | 36                   |
-| 34.8       | +128   | 36                   |
-
-Para barrer las 5 capas con la configuración nominal:
+Desde el REPL parado en `PMDKernel/`:
 
 ```julia
-for z in (-128f0, -64f0, 0f0, 64f0, 128f0)
-    simular_disco(z; xy_step=20f0, out_name="disco_nominal_z$(Int(z))")
-end
+include("julia/src/simulate.jl")
+
+geometrias = [
+    geom_grilla_xyz(:grid, -100:10:100, -100:10:100, -100:10:100),
+    geom_sensores_csv(:sens),
+]
+
+simular_dataset(
+    name        = "mi_experimento",
+    geometrias  = geometrias,
+    perturb_cfg = (kind=:both, sigma_deg=1f0,
+                   mu1=2.035f0, sigma1=0.2f0,
+                   mu2=8.48f0,  sigma2=0.85f0),
+    n_samples   = 500, seed_base = 0,
+    out_dir     = "data/datasets",
+    verbose     = true,
+)
 ```
 
-### Estructura del NPZ generado
+O ejecutando el driver: `julia --project=.. julia/scripts/run_v1_dataset.jl`.
 
-| Array            | Forma   | Unidades | Descripción                            |
-|------------------|---------|----------|----------------------------------------|
-| `z_disco_mm`     | (1,)    | mm       | Z del disco                            |
-| `thickness_mm`   | (1,)    | mm       | Grosor del disco (default 1)           |
-| `grid_x_mm`      | (Nx,Ny) | mm       | Coordenada X de cada nodo              |
-| `grid_y_mm`      | (Nx,Ny) | mm       | Coordenada Y                           |
-| `grid_Bx_mT`     | (Nx,Ny) | mT       | Componente X del campo en la grilla    |
-| `grid_By_mT`     | (Nx,Ny) | mT       | Componente Y                           |
-| `grid_Bz_mT`     | (Nx,Ny) | mT       | Componente Z                           |
-| `sensor_idx`     | (k,)    | —        | Índices 1-based (fila del CSV) de los sensores del disco |
-| `sensor_x_mm`    | (k,)    | mm       | Posición X del sensor                  |
-| `sensor_y_mm`    | (k,)    | mm       | Posición Y                             |
-| `sensor_z_mm`    | (k,)    | mm       | Posición Z                             |
-| `sensor_Bx_mT`   | (k,)    | mT       | Campo X medido en el sensor            |
-| `sensor_By_mT`   | (k,)    | mT       | Campo Y                                |
-| `sensor_Bz_mT`   | (k,)    | mT       | Campo Z                                |
+Resultado: `data/datasets/mi_experimento.h5`.
 
-Con `xy_step=20` y `grid_range=(-60,60)` → `Nx=Ny=7` (49 puntos). Con el CSV
-actual, cada capa contiene `k = 36` sensores (36 ángulos × 1 profundidad).
+### Estructura del HDF5 (layout v2)
 
-### Pipeline para un dataset completo
+```
+mi_experimento.h5
+├── geometria/
+│   ├── grid/
+│   │   ├── B          (N, J, 3)    Float32  mT
+│   │   ├── R          (J, 3)       Float32  mm
+│   │   ├── meta/
+│   │   │   ├── x      (Nx,)        Float32  mm
+│   │   │   ├── y      (Ny,)
+│   │   │   └── z      (Nz,)
+│   │   └── attrs: { kind = "cartesian" }
+│   └── sens/
+│       ├── B          (N, I, 3)    Float32  mT
+│       ├── R          (I, 3)       Float32  mm
+│       ├── meta/      (path del CSV como attr)
+│       └── attrs: { kind = "sensor_csv" }
+└── attrs:
+    n_samples, seed_base, perturb_<k>, t_<step>_mean_ms / t_<step>_std_ms / t_<step>_total_s
+```
 
-Combina `perturb_*` con `simular_disco` para generar muchas muestras con
-configuraciones perturbadas de los imanes:
+**Aplanamiento del grid cartesiano:** orden x-outer, z-inner (loop Julia
+`for xi in x, yi in y, zi in z`). En NumPy:
+`f["geometria/grid/B"].reshape(N, Nx, Ny, Nz, 3)` con C-order. Verificable contra
+`np.meshgrid(grid_x, grid_y, grid_z, indexing="ij")` (lo hace el loader).
+
+**Convención del meta::Dict** según `kind`:
+- `:cartesian`   → `meta/x`, `meta/y`, `meta/z` (Vector{Float32}).
+- `:cylindrical` → `meta/r`, `meta/theta`, `meta/z`.
+- `:sensor_csv`  → `path` (attr String).
+- `:custom`      → libre.
+
+### Variantes
 
 ```julia
-include("B0.jl")
-include("utils/disco.jl")
-include("utils/perturb.jl")
+# Benchmark sin escribir HDF5 (estima cuánto tarda el experimento real):
+benchmark_dataset(; geometrias, perturb_cfg, n_samples=10, seed_base=0, warmup=2)
 
-N_MUESTRAS = 100
-capas_z    = (-128f0, -64f0, 0f0, 64f0, 128f0)
-
-for seed in 1:N_MUESTRAS
-    # 1. Genera una configuración perturbada (rotación de imanes σ = 1°)
-    p = perturb_rotation(sigma_deg=1f0, seed=seed,
-                         out_path="data/rot_seed$(seed).npz")
-
-    # 2. Evalúa las 5 capas sobre esa configuración
-    for z in capas_z
-        simular_disco(z; xy_step=20f0,
-                      data_path=p,
-                      out_name="disco_seed$(seed)_z$(Int(z))")
-    end
-end
+# Particionar en múltiples archivos (resumible si se cae):
+simular_dataset_chunked(
+    name = "mi_experimento", geometrias = geometrias,
+    perturb_cfg = ..., n_total = 10_000, chunk_size = 1_000,
+    seed_base = 0, out_dir = "data/datasets",
+)
+# → mi_experimento_part01.h5 .. _part10.h5
 ```
 
-Esto genera `N_MUESTRAS × 5 = 500` archivos en `data/simulaciones/`, cada uno
-un par (sensores → grilla) listo para entrenamiento. Otras variantes:
-`perturb_magnitude`, `perturb_both` (ver `utils/perturb.jl`).
+Si un chunk se cae, volver a correr la misma llamada retoma desde donde quedó:
+`skip_existing = true` (default) saltea cualquier `<name>_part<NN>.h5` ya escrito.
+Para forzar la regeneración de un chunk, borrar el archivo correspondiente o
+pasar `skip_existing = false`.
 
-### Parámetros de `simular_disco`
+### Grillas no cartesianas / geometrías arbitrarias
 
-| Parámetro    | Default         | Descripción                                   |
-|--------------|-----------------|-----------------------------------------------|
-| `z_mm`       | —               | Z del disco (mm, requerido)                   |
-| `xy_step`    | `20`            | Paso de la grilla en X e Y (mm)               |
-| `grid_range` | `(-60, 60)`     | Rango X-Y de la grilla (mm)                   |
-| `thickness`  | `1`             | Grosor del disco en Z (mm)                    |
-| `threads`    | `256`           | Hilos CUDA por bloque                         |
-| `data_path`  | `data/B0.npz`   | NPZ de imanes (cámbialo para perturbados)     |
-| `out_name`   | `"disco_z<z>"`  | Nombre del archivo de salida (sin extensión)  |
+```julia
+# Cilíndrica
+geom_grilla_cilindrica(:cyl, 0:5:160, 0:10:350, -60:5:60)
+
+# Lista de puntos arbitraria (línea, esfera, nube custom...)
+puntos = [...] :: Matrix{Float32}    # (n, 3) xyz mm
+geom_puntos(:linea_x, puntos)
+```
+
+---
+
+## Modelos en Python
+
+Cada iteración de modelo vive en su propio paquete bajo `Python/Models/<NOMBRE>/`,
+con la siguiente estructura mínima:
+
+```
+Models/<NOMBRE>/
+├── __init__.py
+├── data.py     # load_dataset(h5_path), split_and_normalize(...), make_loader(...)
+├── model.py    # clase del modelo (subclass de nn.Module) + build_model()
+├── train.py    # train(model, loader_tr, loader_va, ...) → dict(history, best_state, best_val)
+└── metrics.py  # predict(...), metrics(y_true, y_pred), report(name, m)
+```
+
+El **notebook homónimo** (`Python/<NOMBRE>.ipynb`) sirve sólo para iterar
+visualmente: importa los módulos y orquesta prints/plots. **No define lógica
+entrenable.** Esto permite ejecutar lo mismo en headless sin Jupyter (cluster
+HPC).
+
+### Crear una iteración nueva
+
+1. `mkdir Python/Models/v2_<algo>`, copiar `__init__.py` y los cuatro módulos
+   desde `v1_fcnn` como base.
+2. Ajustar `model.py` (arquitectura), `data.py` si cambia el preprocesamiento, y
+   `train.py` si cambia el optimizador / scheduler / loss.
+3. Crear `Python/v2_<algo>.ipynb` que importe del nuevo paquete.
+4. Componentes compartidos entre iteraciones → refactorear a
+   `Python/Models/_common/` antes de duplicar.
+
+### Iteración actual
+
+`v2_pinn` — Función de campo condicional `f(B_sens, x, y, z) → B(x,y,z)`. FCNN
+de capas crecientes (~280k params) con activación SiLU. Loss combinada:
+
+- **Datos**: MSE vs `B_grid` del simulador.
+- **Maxwell**: `∇·B = 0` y `∇×B = 0`, vía `torch.autograd.grad` sobre las
+  coordenadas (regiones libres de corrientes).
+- **TV**: `mean(|∇B|)` para suavizado espacial.
+
+Cada step de SGD ve **una sola configuración** con K puntos random — necesario
+para que las losses físicas tengan sentido sobre un campo coherente.
+
+Iteración anterior (`v1_fcnn`) abandonada: era un mapeo `B_sens (540) →
+B_grid_aplanada (60.858)` puramente data-driven (MSE solo), con ~63M params.
+La arquitectura de v2 es ~225× más chica y aprende un campo continuo.
+
 
 ---
 
 ## Layout de arrays en el kernel
 
-| Array | Shape  | Layout       | Unidades | Rol                    |
-|-------|--------|--------------|----------|------------------------|
-| R     | [n, 3] | row-major    | m        | Puntos de evaluación   |
-| P     | [3, m] | column-major | m        | Posiciones de imanes   |
-| M     | [3, m] | column-major | A·m²     | Momentos magnéticos    |
-| B     | [n, 3] | row-major    | T        | Campo de salida        |
+| Array | Shape   | Layout       | Unidades | Rol                    |
+|-------|---------|--------------|----------|------------------------|
+| `R`   | `[n,3]` | row-major    | mm       | Puntos de evaluación   |
+| `P`   | `[3,m]` | column-major | mm       | Posiciones de imanes   |
+| `M`   | `[3,m]` | column-major | A·m²     | Momentos magnéticos    |
+| `B`   | `[n,3]` | row-major    | T        | Campo de salida        |
 
-La asimetría row/column-major es intencional: garantiza accesos coalescentes en
-GPU y tiling eficiente en memoria compartida (`BATCH_M = 64` dipolos por tile).
+La asimetría row/column-major es intencional. El kernel usa unrolling de 4 dipolos por iteración (sin shared-memory
+tiling). `B0.jl` convierte mm → m internamente — la API de usuario es siempre mm.
 
-## Requisitos de scope
+`R` puede ser cualquier conjunto de puntos: `R = R_grid` (para evaluar el
+volumen) o `R = R_sens` (para evaluar sólo en los sensores). El kernel no
+distingue.
 
-`BATCH_M` y `T` deben estar definidos en el scope **antes** de incluir
-`kernel.jl` o cualquier utilidad. `B0.jl` los define al incluirse:
+### Singularidad y clamp
 
-```julia
-const BATCH_M = 64
-const T       = Float32
-```
+Las contribuciones cerca de los dipolos pueden divergir (`1/r³`); el kernel
+clampea la magnitud de salida a `B_MAX_T = 0.06 T` (60 mT) preservando dirección.
+La guarda interna es `r² > 1e-8` m² (equivalente a `r > 0.1 mm`): cualquier pareja
+punto-dipolo a menos de 0.1 mm aporta 0 a la suma. Es un cutoff físico, no sólo
+un epsilon numérico — a escalas menores el modelo dipolar puntual deja de
+describir al imán real, así que descartar esas contribuciones es más razonable
+que extrapolar la singularidad.
+
+---
+
+## Convención del eje X
+
+El proyecto usa `+x` creciendo de **derecha a izquierda** `+y` creciendo de **suelo a techo**. Plots XY deben invertir el eje X (`ax.invert_xaxis()`)
+para respetar la orientación física.
+
+---
